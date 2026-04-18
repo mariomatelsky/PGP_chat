@@ -5,14 +5,14 @@ Terminal chat with end-to-end encryption. Two people, direct TCP connection, no 
 Uses RSA-4096 key pairs for identity and authentication, AES-256-GCM for message encryption. Chat history is saved locally and encrypted with a key derived from your private key.
 
 ```
-░▒▓█ PGPCHAT █▓▒░  ·  RSA-4096 // AES-256-GCM  ·  alice  ·  14:32:01
+░▒▓█ PGPCHAT █▓▒░  ·  RSA-4096 // AES-256-GCM  ·  MARIUSZ  ·  14:32:01
 ╔══════════════════════╦═══════════════════════════════════════════════╗
 ║  C O N T A C T S    ║  CHANNEL : BOB                 [ ENCRYPTED ] ║
 ╠══════════════════════╬═══════════════════════════════════════════════╣
 ║ ► BOB           ●   ║  14:30    BOB ▌ yo                            ║
-║   CHARLIE       ○   ║  14:31  ALICE ▌ hey                           ║
+║   CHARLIE       ○   ║  14:31  MARIUSZ ▌ hey                           ║
 ╠══════════════════════╬═══════════════════════════════════════════════╣
-║  ● 1 / 2  ONLINE    ║  ALICE►  _                                    ║
+║  ● 1 / 2  ONLINE    ║  MARIUSZ►  _                                    ║
 ╚══════════════════════╩═══════════════════════════════════════════════╝
 ```
 
