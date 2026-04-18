@@ -1,23 +1,3 @@
-"""
-Retro phosphor-green split-panel terminal UI.
-
-Visual layout (80×24 minimum):
-
-  ░▒▓█ PGPCHAT █▓▒░  ·  RSA-4096 // AES-256-GCM  ·  nick  ·  HH:MM:SS
-  ╔══════════════════════╦═══════════════════════════════════════════════╗
-  ║  C O N T A C T S    ║  CHANNEL : ALICE               [ ENCRYPTED ] ║
-  ╠══════════════════════╬═══════════════════════════════════════════════╣
-  ║ ► ALICE         ●   ║  12:34  ALICE ▌ hey man                      ║
-  ║   BOB           ○   ║  12:35    YOU ▌ sup                           ║
-  ║   CHARLIE       ●   ║  12:35  ALICE ▌ you get the key?             ║
-  ║                     ║                                               ║
-  ╠══════════════════════╬═══════════════════════════════════════════════╣
-  ║  ● 2 / 3  ONLINE    ║  YOU►  _                                      ║
-  ╚══════════════════════╩═══════════════════════════════════════════════╝
-
-Colours: green body, yellow titles/system, white own text, red errors,
-black-on-green header/selected contact.
-"""
 
 import curses
 import queue
