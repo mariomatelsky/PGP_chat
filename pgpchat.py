@@ -52,7 +52,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import crypto
 import storage
-from network import DEFAULT_PORT, connect_to_peer, listen_for_one
+from network import (
+    DEFAULT_PORT,
+    connect_to_peer,
+    listen_for_one,
+    connect_via_relay,
+    listen_via_relay,
+)
 from ui import RetroUI
 
 
@@ -540,6 +546,133 @@ def cmd_connect(args):
     )
 
 
+# ── relay helpers ──────────────────────────────────────────────────────────────
+
+def _get_relay(args_host_port: Optional[str] = None) -> Tuple[str, int]:
+    """Return (host, port) for relay server.  Checks arg, then config, then asks."""
+    cfg = _load_config()
+    if args_host_port:
+        if ":" in args_host_port:
+            h, p = args_host_port.rsplit(":", 1)
+            return h.strip(), int(p.strip())
+        return args_host_port.strip(), DEFAULT_PORT
+    if cfg.get("relay_host"):
+        return cfg["relay_host"], cfg.get("relay_port", DEFAULT_PORT)
+    host = input("Relay server host: ").strip()
+    if not host:
+        _die("Relay host required.")
+    port_s = input(f"Relay server port [{DEFAULT_PORT}]: ").strip()
+    return host, int(port_s) if port_s else DEFAULT_PORT
+
+
+def cmd_set_relay(args):
+    """Store relay server address in config."""
+    if not args:
+        _die("Usage:  pgpchat set-relay <host> [port]")
+    host = args[0]
+    port = int(args[1]) if len(args) >= 2 else DEFAULT_PORT
+    cfg  = _load_config()
+    cfg["relay_host"] = host
+    cfg["relay_port"] = port
+    _save_config(cfg)
+    print(f"✓ Relay server set to {host}:{port}")
+
+
+def cmd_relay_call(args):
+    """Call a contact via the relay server."""
+    if not args:
+        _die("Usage:  pgpchat relay-call <name> [relay_host[:port]]")
+
+    name      = args[0]
+    priv, pub = _load_my_keys()
+    cfg       = _load_config()
+    my_nick   = cfg.get("nickname", "me")
+    contacts  = _load_contacts()
+    contact   = _contact_by_name(name, contacts)
+
+    if not contact:
+        _die(f"Contact not found: {name}")
+
+    relay_arg  = args[1] if len(args) >= 2 else None
+    relay_host, relay_port = _get_relay(relay_arg)
+
+    peer_fp = contact["fingerprint"]
+    print(f"[{_now()}]  Calling {name} via relay {relay_host}:{relay_port} …")
+
+    _run_one_session(
+        net_coro_factory=lambda iq, oq: connect_via_relay(
+            relay_host, relay_port, peer_fp,
+            priv, pub, my_nick, contacts, iq, oq,
+        ),
+        priv=priv,
+        my_nick=my_nick,
+        contacts=contacts,
+        port=relay_port,
+        known_peer_fp=peer_fp,
+        standby_msg=f"CALLING {name.upper()} VIA RELAY",
+    )
+
+
+def cmd_relay_listen(args):
+    """One-shot: connect to relay and wait for any known contact to call."""
+    priv, pub = _load_my_keys()
+    cfg       = _load_config()
+    my_nick   = cfg.get("nickname", "me")
+    contacts  = _load_contacts()
+    if not contacts:
+        _die("No contacts yet.  Import one first:  pgpchat import <name>")
+
+    relay_arg  = args[0] if args else None
+    relay_host, relay_port = _get_relay(relay_arg)
+
+    _run_one_session(
+        net_coro_factory=lambda iq, oq: listen_via_relay(
+            relay_host, relay_port,
+            priv, pub, my_nick, contacts, iq, oq,
+        ),
+        priv=priv,
+        my_nick=my_nick,
+        contacts=contacts,
+        port=relay_port,
+        standby_msg=f"WAITING ON RELAY {relay_host}:{relay_port}",
+    )
+
+
+def cmd_relay_daemon(args):
+    """Persistent relay listener — re-registers after each session."""
+    priv, pub = _load_my_keys()
+    cfg       = _load_config()
+    my_nick   = cfg.get("nickname", "me")
+
+    relay_arg  = args[0] if args else None
+    relay_host, relay_port = _get_relay(relay_arg)
+
+    while True:
+        try:
+            contacts = _load_contacts()
+            if not contacts:
+                print("No contacts yet — import someone first:  pgpchat import <name>")
+                print("Retrying in 10 s …")
+                time.sleep(10)
+                continue
+
+            _run_one_session(
+                net_coro_factory=lambda iq, oq: listen_via_relay(
+                    relay_host, relay_port,
+                    priv, pub, my_nick, contacts, iq, oq,
+                ),
+                priv=priv,
+                my_nick=my_nick,
+                contacts=contacts,
+                port=relay_port,
+                standby_msg=f"RELAY DAEMON  {relay_host}:{relay_port}",
+            )
+
+        except KeyboardInterrupt:
+            print("\n\nRelay daemon stopped.")
+            break
+
+
 def cmd_history(args):
     if not args:
         _die("Usage:  pgpchat history <name>")
@@ -568,50 +701,67 @@ def cmd_history(args):
 # dispatch
 
 COMMANDS = {
-    "keygen":       cmd_keygen,
-    "whoami":       cmd_whoami,
-    "import":       cmd_import,
-    "contacts":     cmd_contacts,
-    "remove":       cmd_remove,
-    "set-address":  cmd_set_address,
-    "daemon":       cmd_daemon,
-    "call":         cmd_call,
-    "listen":       cmd_listen,
-    "connect":      cmd_connect,
-    "history":      cmd_history,
+    "keygen":        cmd_keygen,
+    "whoami":        cmd_whoami,
+    "import":        cmd_import,
+    "contacts":      cmd_contacts,
+    "remove":        cmd_remove,
+    "set-address":   cmd_set_address,
+    "daemon":        cmd_daemon,
+    "call":          cmd_call,
+    "listen":        cmd_listen,
+    "connect":       cmd_connect,
+    "history":       cmd_history,
+    # relay-server routing
+    "set-relay":     cmd_set_relay,
+    "relay-call":    cmd_relay_call,
+    "relay-listen":  cmd_relay_listen,
+    "relay-daemon":  cmd_relay_daemon,
 }
 
 HELP = """\
 pgpchat — PGP-style encrypted P2P terminal communicator
 
 Setup (one-time, both sides):
-  keygen                          Generate your RSA-4096 key pair
-  whoami                          Print your public key to share with contacts
-  import  <name> [keyfile]        Import a contact's public key (+ optional address)
-  set-address <name> <host> [p]   Store/update a contact's IP address
+  keygen                              Generate your RSA-4096 key pair
+  whoami                              Print your public key to share with contacts
+  import  <name> [keyfile]            Import a contact's public key (+ optional address)
+  set-address <name> <host> [port]    Store/update a contact's direct IP address
 
 Contacts:
-  contacts                        List contacts with stored addresses
-  remove  <name>                  Remove a contact
+  contacts                            List contacts with stored addresses
+  remove  <name>                      Remove a contact
 
-Chat:
-  daemon  [port]                  Persistent listener — stays alive, loops after each call
-  call    <name> [host] [port]    Call a contact (uses stored address if host omitted)
-  listen  [port]                  One-shot listen, then exit  (default port: 7890)
-  connect <name> <host> [port]    One-shot connect, then exit
+── Direct (P2P) — both machines need reachable IPs ──────────────────────────
+  daemon  [port]                      Persistent listener, loops after each call
+  call    <name> [host] [port]        Call a contact directly (uses stored address)
+  listen  [port]                      One-shot listen, then exit
+  connect <name> <host> [port]        One-shot direct connect, then exit
+
+── Via relay server — works behind NAT, no port forwarding needed ────────────
+  set-relay <host> [port]             Save relay server address (used by relay-* commands)
+  relay-daemon [relay_host[:port]]    Persistent relay listener, loops after each call
+  relay-call   <name> [relay_host]    Call a contact through the relay server
+  relay-listen [relay_host[:port]]    One-shot relay listen, then exit
 
 History:
-  history <name>                  View encrypted local chat log
+  history <name>                      View encrypted local chat log
 
-Quickstart:
-  # Machine A                       # Machine B
-  pgpchat keygen                    pgpchat keygen
-  pgpchat whoami | mail B           pgpchat whoami | mail A
-  pgpchat import bob bob.pub        pgpchat import alice alice.pub
-  pgpchat set-address bob 10.0.0.2  pgpchat daemon
-  pgpchat daemon
-                                     # From a second terminal on B:
-  pgpchat call bob                   pgpchat call alice 10.0.0.1
+Quickstart (direct):
+  # Machine A                           # Machine B
+  pgpchat keygen                        pgpchat keygen
+  pgpchat whoami | mail B               pgpchat whoami | mail A
+  pgpchat import bob bob.pub            pgpchat import alice alice.pub
+  pgpchat set-address bob 10.0.0.2      pgpchat daemon
+  pgpchat call bob
+
+Quickstart (via relay server):
+  # On relay machine:
+  python server.py --port 7890
+
+  # Machine A & B (same setup as above, then):
+  pgpchat set-relay relay.example.com   pgpchat set-relay relay.example.com
+  pgpchat relay-daemon                  pgpchat relay-call alice
 
 In-chat commands:  /help  /fp  /clear  /quit
 """

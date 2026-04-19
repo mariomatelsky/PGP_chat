@@ -323,6 +323,311 @@ async def listen_for_one(
         watcher.cancel()
 
 
+# ── Relay-server client functions ─────────────────────────────────────────────
+
+async def _server_auth(
+    reader,
+    writer,
+    my_private_key,
+    my_public_key,
+    my_fingerprint: str,
+    my_nickname: str,
+) -> None:
+    """Authenticate with the relay server (one-way challenge from server)."""
+    await _send(writer, {
+        "type":       "HELLO",
+        "fingerprint": my_fingerprint,
+        "pubkey_pem":  crypto.serialize_public_key(my_public_key),
+        "nickname":    my_nickname,
+        "version":     VERSION,
+    })
+
+    challenge = await _read(reader)
+    if not challenge or challenge.get("type") != "CHALLENGE":
+        raise AuthError(f"Expected CHALLENGE from relay server, got: {challenge}")
+
+    try:
+        nonce = base64.b64decode(challenge["nonce_b64"])
+    except Exception:
+        raise AuthError("Malformed nonce from relay server")
+
+    await _send(writer, {
+        "type":    "CHALLENGE_RESPONSE",
+        "sig_b64": crypto.sign(nonce, my_private_key),
+    })
+
+    ready = await _read(reader)
+    if not ready or ready.get("type") != "SERVER_READY":
+        raise AuthError(f"Expected SERVER_READY from relay server, got: {ready}")
+
+
+async def _relay_chat_loop(
+    reader,
+    writer,
+    peer_nick: str,
+    peer_fp: str,
+    peer_pubkey,
+    my_private_key,
+    incoming_q: queue.Queue,
+    outgoing_q: queue.Queue,
+    stop_event: asyncio.Event,
+) -> None:
+    """Like _chat_loop but over a relay connection (RELAY/RELAYED frames)."""
+    loop = asyncio.get_running_loop()
+
+    async def recv_task():
+        while not stop_event.is_set():
+            try:
+                msg = await _read(reader, timeout=READ_TIMEOUT)
+            except asyncio.TimeoutError:
+                continue
+            if msg is None:
+                _log.debug("relay recv_task: connection closed (%s)", peer_nick)
+                incoming_q.put(("DISCONNECT", peer_nick, None))
+                stop_event.set()
+                return
+            mtype = msg.get("type")
+            if mtype in ("PING", "PONG", "DELIVERED", "QUEUED"):
+                continue
+            if mtype == "KICKED":
+                incoming_q.put(("ERROR", None, f"Relay server kicked us: {msg.get('reason')}"))
+                stop_event.set()
+                return
+            if mtype == "BYE":
+                incoming_q.put(("DISCONNECT", peer_nick, None))
+                stop_event.set()
+                return
+            if mtype == "RELAYED":
+                if msg.get("from") != peer_fp:
+                    continue  # message from a different contact — ignore in this session
+                payload = msg.get("payload", {})
+                sig     = msg.get("sig_b64", "")
+                ts      = msg.get("ts", time.time())
+                payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                if not crypto.verify(payload_bytes, sig, peer_pubkey):
+                    incoming_q.put(("WARNING", peer_nick, "⚠  Message signature invalid — discarded"))
+                    continue
+                try:
+                    plaintext = crypto.decrypt_message(payload, my_private_key)
+                    incoming_q.put(("MSG", peer_nick, plaintext, ts))
+                except Exception as exc:
+                    incoming_q.put(("WARNING", peer_nick, f"⚠  Decryption error: {exc}"))
+            elif mtype == "ERROR":
+                incoming_q.put(("WARNING", None, f"Relay error: {msg.get('reason')}"))
+
+    async def send_task():
+        last_send = time.time()
+        while not stop_event.is_set():
+            try:
+                text = await loop.run_in_executor(None, lambda: outgoing_q.get(timeout=0.4))
+            except Exception:
+                if time.time() - last_send >= KEEPALIVE_INTERVAL:
+                    try:
+                        await _send(writer, {"type": "PING"})
+                        last_send = time.time()
+                    except Exception as exc:
+                        _log.debug("relay send_task: keepalive failed (%s)", exc)
+                        stop_event.set()
+                        return
+                continue
+            try:
+                if text is None:  # /quit sentinel
+                    await _send(writer, {"type": "BYE"})
+                    stop_event.set()
+                    return
+                payload       = crypto.encrypt_message(text, peer_pubkey)
+                payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                sig           = crypto.sign(payload_bytes, my_private_key)
+                await _send(writer, {
+                    "type":    "RELAY",
+                    "to":      peer_fp,
+                    "payload": payload,
+                    "sig_b64": sig,
+                    "ts":      time.time(),
+                })
+                last_send = time.time()
+            except Exception as exc:
+                _log.debug("relay send_task: exception → stopping (%s)", exc)
+                stop_event.set()
+                return
+
+    await asyncio.gather(recv_task(), send_task())
+
+
+async def connect_via_relay(
+    server_host: str,
+    server_port: int,
+    target_fp: str,
+    my_private_key,
+    my_public_key,
+    my_nickname: str,
+    contacts: Dict,
+    incoming_q: queue.Queue,
+    outgoing_q: queue.Queue,
+) -> None:
+    """Connect to a contact through a relay server."""
+    my_fp = crypto.fingerprint(my_public_key)
+    try:
+        reader, writer = await asyncio.open_connection(server_host, server_port)
+    except Exception as exc:
+        incoming_q.put(("ERROR", None, f"Cannot reach relay {server_host}:{server_port} — {exc}"))
+        return
+
+    try:
+        await _server_auth(reader, writer, my_private_key, my_public_key, my_fp, my_nickname)
+    except AuthError as exc:
+        incoming_q.put(("ERROR", None, f"Relay auth failed: {exc}"))
+        writer.close()
+        return
+
+    if target_fp not in contacts:
+        incoming_q.put(("ERROR", None, f"Target fingerprint not in contacts: {target_fp[:20]}…"))
+        writer.close()
+        return
+
+    # Check if target is connected to relay
+    await _send(writer, {"type": "WHO", "fingerprint": target_fp})
+    who = await _read(reader)
+    if not who or who.get("type") != "WHO_RESP":
+        incoming_q.put(("ERROR", None, "Relay did not respond to WHO query"))
+        writer.close()
+        return
+    if not who.get("online"):
+        incoming_q.put(("ERROR", None, "Contact is not connected to the relay server"))
+        writer.close()
+        return
+
+    peer_nick   = contacts[target_fp]["name"]
+    peer_pubkey = contacts[target_fp]["pubkey"]
+
+    _log.debug("connect_via_relay: target %s (%s) is online", peer_nick, target_fp[:20])
+    incoming_q.put(("CONNECTED", peer_nick, (server_host, server_port)))
+
+    try:
+        stop_event = asyncio.Event()
+        await _relay_chat_loop(
+            reader, writer,
+            peer_nick, target_fp, peer_pubkey,
+            my_private_key,
+            incoming_q, outgoing_q, stop_event,
+        )
+    except Exception as exc:
+        _log.debug("connect_via_relay: unexpected exception: %s", exc)
+        incoming_q.put(("ERROR", None, f"Relay session error: {exc}"))
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def listen_via_relay(
+    server_host: str,
+    server_port: int,
+    my_private_key,
+    my_public_key,
+    my_nickname: str,
+    contacts: Dict,
+    incoming_q: queue.Queue,
+    outgoing_q: queue.Queue,
+) -> None:
+    """Connect to relay and wait for an incoming message from any known contact."""
+    my_fp = crypto.fingerprint(my_public_key)
+    try:
+        reader, writer = await asyncio.open_connection(server_host, server_port)
+    except Exception as exc:
+        incoming_q.put(("ERROR", None, f"Cannot reach relay {server_host}:{server_port} — {exc}"))
+        return
+
+    try:
+        await _server_auth(reader, writer, my_private_key, my_public_key, my_fp, my_nickname)
+    except AuthError as exc:
+        incoming_q.put(("ERROR", None, f"Relay auth failed: {exc}"))
+        writer.close()
+        return
+
+    incoming_q.put(("LISTENING", None, f"relay://{server_host}:{server_port}"))
+    _log.debug("listen_via_relay: registered, waiting for caller")
+
+    loop = asyncio.get_running_loop()
+    peer_nick = peer_fp = peer_pubkey = first_msg = None
+
+    # Standby: wait for the first RELAYED message from a known contact
+    while True:
+        # Non-blocking check for /quit
+        try:
+            item = outgoing_q.get_nowait()
+            if item is None:
+                await _send(writer, {"type": "BYE"})
+                writer.close()
+                return
+            outgoing_q.put(item)
+        except queue.Empty:
+            pass
+
+        try:
+            msg = await _read(reader, timeout=READ_TIMEOUT)
+        except asyncio.TimeoutError:
+            continue
+
+        if msg is None:
+            incoming_q.put(("DISCONNECT", None, None))
+            writer.close()
+            return
+
+        mtype = msg.get("type")
+        if mtype == "KICKED":
+            incoming_q.put(("ERROR", None, f"Relay kicked us: {msg.get('reason')}"))
+            writer.close()
+            return
+        if mtype == "PING":
+            await _send(writer, {"type": "PONG"})
+            continue
+        if mtype == "RELAYED":
+            from_fp = msg.get("from", "")
+            if from_fp in contacts:
+                peer_fp     = from_fp
+                peer_nick   = contacts[from_fp]["name"]
+                peer_pubkey = contacts[from_fp]["pubkey"]
+                first_msg   = msg
+                break
+            _log.debug("listen_via_relay: RELAYED from unknown fingerprint %s…, ignored", from_fp[:16])
+
+    # Process the first message that "rang" us
+    incoming_q.put(("CONNECTED", peer_nick, (server_host, server_port)))
+    payload       = first_msg.get("payload", {})
+    sig           = first_msg.get("sig_b64", "")
+    ts            = first_msg.get("ts", time.time())
+    payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    if crypto.verify(payload_bytes, sig, peer_pubkey):
+        try:
+            plaintext = crypto.decrypt_message(payload, my_private_key)
+            incoming_q.put(("MSG", peer_nick, plaintext, ts))
+        except Exception as exc:
+            incoming_q.put(("WARNING", peer_nick, f"⚠  First message decryption failed: {exc}"))
+    else:
+        incoming_q.put(("WARNING", peer_nick, "⚠  First message signature invalid — discarded"))
+
+    try:
+        stop_event = asyncio.Event()
+        await _relay_chat_loop(
+            reader, writer,
+            peer_nick, peer_fp, peer_pubkey,
+            my_private_key,
+            incoming_q, outgoing_q, stop_event,
+        )
+    except Exception as exc:
+        _log.debug("listen_via_relay: unexpected exception: %s", exc)
+        incoming_q.put(("ERROR", None, f"Relay session error: {exc}"))
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
 async def connect_to_peer(
     host: str,
     port: int,
