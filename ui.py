@@ -178,7 +178,7 @@ class RetroUI:
     def _handle_key(self, ch, msg_rows: int) -> None:
         if ch in (curses.KEY_ENTER, ord("\n"), ord("\r"), "\n", "\r"):
             self._submit()
-        elif ch in (curses.KEY_BACKSPACE, ord("\x7f"), ord("\b")):
+        elif ch in (curses.KEY_BACKSPACE, ord("\x7f"), ord("\b"), "\x7f", "\b"):
             self.input_buf = self.input_buf[:-1]
         elif ch == curses.KEY_UP:
             top = max(0, len(self.messages) - msg_rows)
@@ -388,6 +388,7 @@ class RetroUI:
         ri           = w - lw - 2
         content_rows = h - 7
         col          = lw
+        bubble_max   = max(10, int(ri * 0.72))  # bubbles use at most 72% of panel
 
         color_map = {
             "me":   curses.color_pair(CP_ME)    | curses.A_BOLD,
@@ -396,7 +397,6 @@ class RetroUI:
             "err":  curses.color_pair(CP_ERR),
         }
 
-        nick_w   = max(len(self.my_nick), len(self.peer_nick), 5, 6)
         total    = len(self.messages)
         view_end = max(0, total - self.scroll)
         view_st  = max(0, view_end - content_rows)
@@ -406,10 +406,26 @@ class RetroUI:
             row  = 4 + i
             attr = color_map.get(ck, curses.color_pair(CP_BODY))
             ts_s = _mts(ts)
-            nick_s = nick[:nick_w].rjust(nick_w)
-            pfx    = f" {ts_s}  {nick_s} ▌ "
-            avail  = ri - len(pfx)
-            line   = (pfx + text[:max(0, avail)]).ljust(ri + 1)[:ri + 1]
+
+            if ck == "me":
+                # Right side: "text  Nick · HH:MM ▶"  right-justified
+                suffix = f"  {nick} · {ts_s} ▶"
+                avail  = bubble_max - len(suffix)
+                body   = text[:max(0, avail)]
+                content = body + suffix
+                line   = content.rjust(ri)[:ri]
+            elif ck == "peer":
+                # Left side: "◀ HH:MM · Nick  text"  left-justified
+                prefix = f"◀ {ts_s} · {nick}  "
+                avail  = bubble_max - len(prefix)
+                body   = text[:max(0, avail)]
+                content = prefix + body
+                line   = content.ljust(ri)[:ri]
+            else:
+                # System / error: centred
+                content = f"── {text} ──"
+                line    = content[:ri].center(ri)[:ri]
+
             _safe(stdscr, row, col, line, attr)
 
         if self.scroll > 0:
