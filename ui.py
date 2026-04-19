@@ -176,7 +176,7 @@ class RetroUI:
 
 
     def _handle_key(self, ch, msg_rows: int) -> None:
-        if ch in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+        if ch in (curses.KEY_ENTER, ord("\n"), ord("\r"), "\n", "\r"):
             self._submit()
         elif ch in (curses.KEY_BACKSPACE, ord("\x7f"), ord("\b")):
             self.input_buf = self.input_buf[:-1]

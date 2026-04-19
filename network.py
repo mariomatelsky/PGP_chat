@@ -34,11 +34,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-VERSION         = "1.0"
-DEFAULT_PORT    = 7890
-HANDSHAKE_TO    = 30   # seconds to complete the full handshake
-READ_TIMEOUT    = 1.0  # seconds for chat-loop reads (allows stop-event polling)
-MAX_LINE_BYTES  = 128 * 1024  # 128 KB hard limit per framed message
+VERSION           = "1.0"
+DEFAULT_PORT      = 7890
+HANDSHAKE_TO      = 30   # seconds to complete the full handshake
+READ_TIMEOUT      = 1.0  # seconds for chat-loop reads (allows stop-event polling)
+MAX_LINE_BYTES    = 128 * 1024  # 128 KB hard limit per framed message
+KEEPALIVE_INTERVAL = 30  # send PING if idle this many seconds (beats NAT timeouts)
 
 
 async def _read(reader: asyncio.StreamReader, timeout: float = HANDSHAKE_TO) -> Optional[Dict]:
@@ -179,6 +180,8 @@ async def _chat_loop(
                 stop_event.set()
                 return
             mtype = msg.get("type")
+            if mtype == "PING":
+                continue  # keepalive — no action needed
             if mtype == "BYE":
                 _log.debug("recv_task: BYE received → DISCONNECT (%s)", peer_nick)
                 incoming_q.put(("DISCONNECT", peer_nick, None))
@@ -199,11 +202,21 @@ async def _chat_loop(
                     incoming_q.put(("WARNING", peer_nick, f"⚠  Decryption error: {exc}"))
 
     async def send_task():
+        last_send = time.time()
         while not stop_event.is_set():
             # Poll outgoing queue without blocking the event loop
             try:
                 text = await loop.run_in_executor(None, lambda: outgoing_q.get(timeout=0.4))
             except Exception:
+                # Nothing to send — fire keepalive if idle too long
+                if time.time() - last_send >= KEEPALIVE_INTERVAL:
+                    try:
+                        await _send(writer, {"type": "PING"})
+                        last_send = time.time()
+                    except Exception as exc:
+                        _log.debug("send_task: keepalive failed (%s: %s)", type(exc).__name__, exc)
+                        stop_event.set()
+                        return
                 continue
             try:
                 if text is None:  # /quit sentinel
@@ -219,6 +232,7 @@ async def _chat_loop(
                     "sig_b64": sig,
                     "ts":      time.time(),
                 })
+                last_send = time.time()
             except Exception as exc:
                 _log.debug("send_task: exception → stopping (%s: %s)", type(exc).__name__, exc)
                 stop_event.set()
