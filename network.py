@@ -18,12 +18,21 @@ proves key possession so a leaked fingerprint can't be used to impersonate.
 import asyncio
 import base64
 import json
+import logging
 import os
+import pathlib
 import queue
 import time
 from typing import Dict, Optional, Tuple
 
 import crypto
+
+_log = logging.getLogger("pgpchat.network")
+logging.basicConfig(
+    filename=str(pathlib.Path.home() / ".pgpchat" / "debug.log"),
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
 VERSION         = "1.0"
 DEFAULT_PORT    = 7890
@@ -40,7 +49,8 @@ async def _read(reader: asyncio.StreamReader, timeout: float = HANDSHAKE_TO) -> 
         )
     except asyncio.TimeoutError:
         raise
-    except (asyncio.IncompleteReadError, ConnectionResetError):
+    except (asyncio.IncompleteReadError, ConnectionResetError) as exc:
+        _log.debug("_read: connection closed (%s: %s)", type(exc).__name__, exc)
         return None
     if len(raw) > MAX_LINE_BYTES:
         return None
@@ -164,11 +174,13 @@ async def _chat_loop(
             except asyncio.TimeoutError:
                 continue
             if msg is None:
+                _log.debug("recv_task: msg=None → DISCONNECT (%s)", peer_nick)
                 incoming_q.put(("DISCONNECT", peer_nick, None))
                 stop_event.set()
                 return
             mtype = msg.get("type")
             if mtype == "BYE":
+                _log.debug("recv_task: BYE received → DISCONNECT (%s)", peer_nick)
                 incoming_q.put(("DISCONNECT", peer_nick, None))
                 stop_event.set()
                 return
@@ -207,7 +219,8 @@ async def _chat_loop(
                     "sig_b64": sig,
                     "ts":      time.time(),
                 })
-            except Exception:
+            except Exception as exc:
+                _log.debug("send_task: exception → stopping (%s: %s)", type(exc).__name__, exc)
                 stop_event.set()
                 return
 
@@ -244,21 +257,28 @@ async def listen_for_one(
                 my_private_key, my_public_key,
                 my_fp, my_nickname, contacts,
             )
+            _log.debug("listen handle: handshake OK with %s (%s)", peer_nick, peer_fp[:20])
             incoming_q.put(("CONNECTED", peer_nick, addr))
             stop_event = asyncio.Event()
+            _log.debug("listen handle: entering _chat_loop")
             await _chat_loop(
                 reader, writer,
                 peer_nick, peer_fp, peer_pubkey,
                 my_private_key,
                 incoming_q, outgoing_q, stop_event,
             )
+            _log.debug("listen handle: _chat_loop returned normally")
         except PeerNotKnownError as exc:
+            _log.debug("listen handle: PeerNotKnownError: %s", exc)
             incoming_q.put(("ERROR", None, str(exc)))
         except AuthError as exc:
+            _log.debug("listen handle: AuthError: %s", exc)
             incoming_q.put(("ERROR", None, f"Handshake failed: {exc}"))
         except Exception as exc:
+            _log.debug("listen handle: unexpected exception: %s: %s", type(exc).__name__, exc)
             incoming_q.put(("ERROR", None, f"Unexpected error: {exc}"))
         finally:
+            _log.debug("listen handle: finally — closing writer")
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -312,8 +332,10 @@ async def connect_to_peer(
             my_private_key, my_public_key,
             my_fp, my_nickname, contacts,
         )
+        _log.debug("connect_to_peer: handshake OK with %s (%s)", peer_nick, peer_fp[:20])
         incoming_q.put(("CONNECTED", peer_nick, (host, port)))
         stop_event = asyncio.Event()
+        _log.debug("connect_to_peer: entering _chat_loop")
         await _chat_loop(
             reader, writer,
             peer_nick, peer_fp, peer_pubkey,
@@ -321,10 +343,13 @@ async def connect_to_peer(
             incoming_q, outgoing_q, stop_event,
         )
     except PeerNotKnownError as exc:
+        _log.debug("connect_to_peer: PeerNotKnownError: %s", exc)
         incoming_q.put(("ERROR", None, str(exc)))
     except AuthError as exc:
+        _log.debug("connect_to_peer: AuthError: %s", exc)
         incoming_q.put(("ERROR", None, f"Handshake failed: {exc}"))
     except Exception as exc:
+        _log.debug("connect_to_peer: unexpected exception: %s: %s", type(exc).__name__, exc)
         incoming_q.put(("ERROR", None, f"Unexpected error: {exc}"))
     finally:
         try:
