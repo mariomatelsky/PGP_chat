@@ -38,7 +38,9 @@ async def _read(reader: asyncio.StreamReader, timeout: float = HANDSHAKE_TO) -> 
             reader.readuntil(b"\n"),
             timeout=timeout,
         )
-    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionResetError):
+    except asyncio.TimeoutError:
+        raise
+    except (asyncio.IncompleteReadError, ConnectionResetError):
         return None
     if len(raw) > MAX_LINE_BYTES:
         return None
@@ -158,7 +160,7 @@ async def _chat_loop(
     async def recv_task():
         while not stop_event.is_set():
             try:
-                msg = await asyncio.wait_for(_read(reader, timeout=READ_TIMEOUT), timeout=READ_TIMEOUT + 0.5)
+                msg = await _read(reader, timeout=READ_TIMEOUT)
             except asyncio.TimeoutError:
                 continue
             if msg is None:
@@ -191,19 +193,23 @@ async def _chat_loop(
                 text = await loop.run_in_executor(None, lambda: outgoing_q.get(timeout=0.4))
             except Exception:
                 continue
-            if text is None:  # /quit sentinel
-                await _send(writer, {"type": "BYE"})
+            try:
+                if text is None:  # /quit sentinel
+                    await _send(writer, {"type": "BYE"})
+                    stop_event.set()
+                    return
+                payload       = crypto.encrypt_message(text, peer_pubkey)
+                payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                sig           = crypto.sign(payload_bytes, my_private_key)
+                await _send(writer, {
+                    "type":    "MSG",
+                    "payload": payload,
+                    "sig_b64": sig,
+                    "ts":      time.time(),
+                })
+            except Exception:
                 stop_event.set()
                 return
-            payload       = crypto.encrypt_message(text, peer_pubkey)
-            payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-            sig           = crypto.sign(payload_bytes, my_private_key)
-            await _send(writer, {
-                "type":    "MSG",
-                "payload": payload,
-                "sig_b64": sig,
-                "ts":      time.time(),
-            })
 
     await asyncio.gather(recv_task(), send_task())
 

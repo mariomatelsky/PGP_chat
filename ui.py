@@ -495,5 +495,5 @@ class RetroUI:
         stdscr.nodelay(False)
         try:
             stdscr.getch()
-        except curses.error:
+        except (curses.error, KeyboardInterrupt):
             pass
