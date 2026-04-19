@@ -242,6 +242,7 @@ def _run_one_session(
         on_quit=on_quit,
         active_fp=known_peer_fp,
         standby_msg=standby_msg,
+        listener_mode=known_peer_fp is None,
     )
     ui.run()
 

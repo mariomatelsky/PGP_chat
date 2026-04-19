@@ -63,15 +63,16 @@ class RetroUI:
 
     def __init__(
         self,
-        my_nick:     str,
-        contacts:    List[Dict],
-        port:        int,
-        incoming_q:  queue.Queue,
-        outgoing_q:  queue.Queue,
-        on_message:  Callable[[str], None],
-        on_quit:     Callable[[], None],
-        active_fp:   Optional[str] = None,
-        standby_msg: str           = "",
+        my_nick:       str,
+        contacts:      List[Dict],
+        port:          int,
+        incoming_q:    queue.Queue,
+        outgoing_q:    queue.Queue,
+        on_message:    Callable[[str], None],
+        on_quit:       Callable[[], None],
+        active_fp:     Optional[str] = None,
+        standby_msg:   str           = "",
+        listener_mode: bool          = False,
     ):
         self.my_nick     = my_nick
         self.contacts    = contacts
@@ -80,8 +81,9 @@ class RetroUI:
         self.out_q       = outgoing_q
         self.on_message  = on_message
         self.on_quit     = on_quit
-        self.active_fp   = active_fp or ""
-        self.standby_msg = standby_msg or f"LISTENING ON PORT {port}"
+        self.active_fp     = active_fp or ""
+        self.standby_msg   = standby_msg or f"LISTENING ON PORT {port}"
+        self.listener_mode = listener_mode
 
         # Chat state
         self.state      = STANDBY
@@ -163,6 +165,11 @@ class RetroUI:
 
         elif kind == "ERROR":
             self._sys(f"ERR:  {ev[2]}", "err")
+            if self.state == STANDBY:
+                if self.listener_mode:
+                    self._sys("Press /quit to exit or wait for a new connection.", "sys")
+                else:
+                    self._sys("Press /quit to exit.", "sys")
 
     def _sys(self, text: str, color: str = "sys") -> None:
         self.messages.append((time.time(), "SYSTEM", text, color))
@@ -338,7 +345,7 @@ class RetroUI:
         col  = lw          # first usable column in right panel
         AMB  = curses.color_pair(CP_AMBER) | curses.A_BOLD
         DIM  = curses.color_pair(CP_DIM)   | curses.A_DIM
-        BDY  = curses.color_pair(CP_BODY)
+        ERR  = curses.color_pair(CP_ERR)   | curses.A_BOLD
 
         blink = int(time.time() * 2) % 2 == 0
 
@@ -366,6 +373,15 @@ class RetroUI:
             is_status = i in (7, 9)
             attr      = AMB if (is_logo or is_status) else DIM
             _safe(stdscr, row, col, line[:ri + 1].ljust(ri + 1)[:ri + 1], attr)
+
+        # Show recent system/error messages so handshake failures are visible
+        recent_msgs = [m for m in self.messages if m[3] in ("err", "sys")][-4:]
+        for j, (ts, nick, text, ck) in enumerate(recent_msgs):
+            row = 4 + len(logo) + j
+            if row > h - 4:
+                break
+            attr = ERR if ck == "err" else AMB
+            _safe(stdscr, row, col, f"   {text}"[: ri + 1].ljust(ri + 1)[: ri + 1], attr)
 
 
     def _draw_messages(self, stdscr, h: int, w: int, lw: int) -> None:

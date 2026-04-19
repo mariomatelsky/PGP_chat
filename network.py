@@ -219,6 +219,7 @@ async def listen_for_one(
 ) -> None:
     my_fp = crypto.fingerprint(my_public_key)
     connected = asyncio.Event()
+    done     = asyncio.Event()
 
     async def handle(reader, writer):
         if connected.is_set():
@@ -257,11 +258,29 @@ async def listen_for_one(
                 await writer.wait_closed()
             except Exception:
                 pass
+            done.set()
+
+    async def _watch_quit() -> None:
+        """Release the server if /quit is issued while still in standby."""
+        loop = asyncio.get_running_loop()
+        while not done.is_set() and not connected.is_set():
+            try:
+                item = await loop.run_in_executor(
+                    None, lambda: outgoing_q.get(timeout=0.4)
+                )
+                if item is None:
+                    done.set()
+                    return
+                outgoing_q.put(item)   # put back anything that isn't a quit
+            except Exception:
+                continue
 
     server = await asyncio.start_server(handle, "0.0.0.0", port)
     incoming_q.put(("LISTENING", None, port))
     async with server:
-        await server.serve_forever()
+        watcher = asyncio.ensure_future(_watch_quit())
+        await done.wait()
+        watcher.cancel()
 
 
 async def connect_to_peer(
